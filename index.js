@@ -215,7 +215,8 @@ const getRealtimeQuote = async (symbol) => {
     if (symbol.endsWith('.JK')) {
         try {
             const gSymbol = symbol.replace('.JK', ':IDX');
-            const url = `https://www.google.com/finance/quote/${gSymbol}`;
+            // Add cache busting and window param to force fresh data
+            const url = `https://www.google.com/finance/quote/${gSymbol}?window=1D&t=${Date.now()}`;
             const res = await fetch(url, {
                 headers: { 'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
             });
@@ -230,8 +231,9 @@ const getRealtimeQuote = async (symbol) => {
                     const data = {
                         c: parseFloat(price),
                         dp: parseFloat(percentRaw.replace('%', '').replace('+', '')) || 0,
-                        d: 0, // Delta not always easily parseable, but dp is enough for bot
-                        h: 0, l: 0, o: 0, pc: 0 // Simplification for speed
+                        d: 0,
+                        h: 0, l: 0, o: 0, pc: 0,
+                        fetchTime: new Date() // specific scan time
                     };
 
                     // Cache it
@@ -360,8 +362,9 @@ bot.command('price', async (ctx) => {
         const pct = quote.dp > 0 ? `\\+${quote.dp.toFixed(2)}` : escapeMarkdown(quote.dp.toFixed(2));
 
         const cleanTicker = symbol.replace('.JK', '');
+        const timeStr = quote.fetchTime ? formatTime(quote.fetchTime) : formatTime(Date.now());
         ctx.reply(
-            `💰 *[${escapeMarkdown(cleanTicker)}](https://stockbit.com/symbol/${cleanTicker})*: ${escapeMarkdown(quote.c.toString())} ${reaction} ${pct}%`,
+            `💰 *[${escapeMarkdown(cleanTicker)}](https://stockbit.com/symbol/${cleanTicker})*\nPrice: ${escapeMarkdown(quote.c.toString())} ${reaction} ${pct}%\n🕒 _${timeStr}_`,
             { parse_mode: 'MarkdownV2' }
         );
         console.log(chalk.cyan(`💰 Price check: ${symbol}`));
@@ -796,45 +799,160 @@ bot.command('bsjp', async (ctx) => {
 });
 
 // AUTO SCAN
-cron.schedule('*/30 9-16 * * 1-5', async () => {
-    console.log(chalk.yellow("⏰ Cron scan..."));
+// AUTO SCAN - MINUTE ALERTS (MARKET HOURS)
+cron.schedule('* 9-16 * * 1-5', async () => {
+    // Skip if no subscribers
+    if (subscribers.length === 0) return;
+
+    console.log(chalk.yellow("⏰ Minute scan..."));
 
     try {
-        const sample = getStocksToScan().sort(() => 0.5 - Math.random()).slice(0, 50);
-        const potentialStocks = [];
+        // Scan a random subset of liquid stocks to stay within 60s
+        const sample = getStocksToScan().sort(() => 0.5 - Math.random()).slice(0, 15);
+        const candidates = [];
 
-        for (const ticker of sample) {
+        // Fast scan
+        const promises = sample.map(async (ticker) => {
             try {
                 const q = await getRealtimeQuote(`${ticker}.JK`);
-                if (Math.abs(q.dp) > 4) potentialStocks.push({ ticker, ...q });
-            } catch (e) { /* skip */ }
-            await new Promise(r => setTimeout(r, 2000));
-        }
+                // Filter: Positive change > 1.5% and Price > 200 (avoid penny stocks for safety)
+                if (q.dp > 1.5 && q.c > 200) {
+                    return { ticker, ...q };
+                }
+            } catch (e) { return null; }
+        });
 
-        if (potentialStocks.length > 0) {
-            const topAlerts = potentialStocks.sort((a, b) => Math.abs(b.dp) - Math.abs(a.dp)).slice(0, 8);
-            let message = `⚠️ *ALERT\\!* ⚠️\n\n`;
+        const results = await Promise.all(promises);
+        results.forEach(r => { if (r) candidates.push(r); });
 
-            topAlerts.forEach(s => {
-                const emoji = s.dp > 0 ? '🟢🚀' : '🔴📉';
-                const pct = s.dp > 0 ? `\\+${s.dp.toFixed(2)}` : `${s.dp.toFixed(2)}`;
-                message += `${emoji} *${escapeMarkdown(s.ticker)}* \\(${pct}%\\)\n`;
-            });
+        // If we found good stocks
+        if (candidates.length > 0) {
+            // Pick the best one (highest momentum)
+            const winner = candidates.sort((a, b) => b.dp - a.dp)[0];
+            const cleanTicker = winner.ticker.replace('.JK', '');
+
+            // Get AI "Why Buy" Reason
+            let reason = "Momen pantul! 🚀";
+            try {
+                const prompt = `Stock: ${cleanTicker}, Change: ${winner.dp}%. Give 1 short slang reason to buy (max 10 words). Gen Z style.`;
+                const completion = await groq.chat.completions.create({
+                    messages: [{ role: "user", content: prompt }],
+                    model: "llama-3.3-70b-versatile",
+                    temperature: 0.7,
+                    max_tokens: 30,
+                });
+                reason = completion.choices[0].message.content.replace(/"/g, '').trim();
+            } catch (e) { /* fallback */ }
+
+            // Broadcast to subscribers
+            const message = `
+⚡ *FLASH ALERT* ⚡
+*[${escapeMarkdown(winner.ticker)}](https://stockbit.com/symbol/${cleanTicker})*
+💰 ${escapeMarkdown(winner.c.toString())} \\(\\+${winner.dp.toFixed(2)}%\\)
+
+🗣️ *Kata AI*: _${escapeMarkdown(reason)}_
+
+_Disclaimer On\\!_`;
 
             subscribers.forEach(chatId => {
                 bot.telegram.sendMessage(chatId, message, { parse_mode: 'MarkdownV2' }).catch(e => {
-                    if (e.response?.error_code === 403) {
-                        subscribers = subscribers.filter(id => id !== chatId);
-                        saveSubscribers();
-                    }
+                    // console.log(`Failed to send to ${chatId}`);
                 });
             });
-            console.log(chalk.green(`🚨 ${topAlerts.length} alerts`));
+            console.log(chalk.green(`🚨 Alert sent for ${winner.ticker}`));
         }
     } catch (e) {
-        console.error(chalk.red("Cron error:", e));
+        console.error(chalk.red("Cron error:", e.message));
     }
 }, { timezone: "Asia/Jakarta" });
+
+// --- AI CHAT & VISION ---
+
+// 1. Text Chat (Ngobrol)
+bot.on('text', async (ctx) => {
+    // Ignore commands (starting with /)
+    if (ctx.message.text.startsWith('/')) return;
+
+    const userMessage = ctx.message.text;
+    const chatId = ctx.chat.id;
+
+    console.log(chalk.blue(`💬 Chat from ${ctx.from.username || chatId}: ${userMessage}`));
+
+    // Typing indicator
+    await ctx.sendChatAction('typing');
+
+    const systemPrompt = `
+    Role: You are "Hafischz", a reliable, cool, and successful Gen Z stock trader friend.
+    Style: Slang Indo mixed English (Jaksel style), confident, "no cap".
+    Topic: Stocks, crypto, money, psychology. If off-topic, joke about it but guide back to cuan (money).
+    Disclaimer: Always remind "DYOR" if giving financial hints.
+    `;
+
+    try {
+        const completion = await groq.chat.completions.create({
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: userMessage }
+            ],
+            model: "llama-3.3-70b-versatile",
+            temperature: 0.7,
+            max_tokens: 400,
+        });
+
+        const reply = completion.choices[0].message.content;
+        await ctx.reply(reply, { parse_mode: 'Markdown' });
+
+    } catch (e) {
+        console.error(chalk.red("AI Chat Error:", e.message));
+        ctx.reply("⚠️ AI lagi ngopi, bentar ya bro error dikit.");
+    }
+});
+
+// 2. Vision (Analisa Screenshot/Gambar)
+bot.on('photo', async (ctx) => {
+    console.log(chalk.blue(`📸 Photo received from ${ctx.from.username}`));
+    await ctx.sendChatAction('typing');
+
+    try {
+        // Get the largest file ID
+        const photos = ctx.message.photo;
+        const fileId = photos[photos.length - 1].file_id;
+
+        // Get link and download
+        const fileLink = await ctx.telegram.getFileLink(fileId);
+        const res = await fetch(fileLink);
+        const arrayBuffer = await res.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const base64Image = buffer.toString('base64');
+        const dataUrl = `data:image/jpeg;base64,${base64Image}`;
+
+        // Get caption or default prompt
+        const caption = ctx.message.caption || "Analisa chart saham ini. Kasih insight teknikal, support, resistance, dan prediksi arah. Singkat padat jelas.";
+
+        // Call Groq Vision Model
+        const completion = await groq.chat.completions.create({
+            messages: [
+                {
+                    role: "user",
+                    content: [
+                        { type: "text", text: caption },
+                        { type: "image_url", image_url: { url: dataUrl } }
+                    ]
+                }
+            ],
+            model: "llama-3.2-90b-vision-preview", // Vision capable model
+            temperature: 0.5,
+            max_tokens: 500,
+        });
+
+        const reply = completion.choices[0].message.content;
+        await ctx.reply(`🧠 *Analisa AI:*\n\n${reply}`, { parse_mode: 'Markdown' });
+
+    } catch (e) {
+        console.error(chalk.red("Vision Error:", e.message));
+        ctx.reply("❌ Gagal analisa gambar bro. Pastikan gambar jelas ya!");
+    }
+});
 
 // STARTUP
 console.clear();
