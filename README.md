@@ -1,4 +1,4 @@
-# 🚀 Day Trading Bot (Gen Z Edition)
+# 🚀 Day Trading Bot
 
 **Moon or Bust!** 🌙💰
 
