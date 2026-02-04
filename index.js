@@ -17,8 +17,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import chalk from 'chalk';
 import figlet from 'figlet';
-import { ALL_IDX_STOCKS } from './idx_stocks_comprehensive.js';
-import { LIQUID_STOCKS } from './idx_liquid.js';
+import { ALL_IDX_STOCKS } from './data/idx_stocks_comprehensive.js';
+import { LIQUID_STOCKS } from './data/idx_liquid.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
